@@ -537,6 +537,41 @@ public:
      */
     virtual void beforeSave() const {}
 
+    /**
+     * Save a regenerable property value outside the document archive.
+     *
+     * The default implementation reports that the property has no external
+     * derived-data codec. Implementations must write a self-contained,
+     * versioned payload below @p directory.
+     */
+    virtual bool saveDerivedData(const std::string& directory) const
+    {
+        (void)directory;
+        return false;
+    }
+
+    /**
+     * Restore a regenerable property value previously written by
+     * saveDerivedData().
+     */
+    virtual bool restoreDerivedData(const std::string& directory)
+    {
+        (void)directory;
+        return false;
+    }
+
+    /// Return whether this property type implements the derived-data codec.
+    virtual bool supportsDerivedData() const
+    {
+        return false;
+    }
+
+    /// Return whether the current value is non-empty.
+    virtual bool hasDerivedData() const
+    {
+        return false;
+    }
+
     friend class PropertyContainer;
     friend struct PropertyData;
     friend class DynamicProperty;

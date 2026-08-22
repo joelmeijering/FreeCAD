@@ -75,11 +75,15 @@
 #include "Application.h"
 #include "AutoTransaction.h"
 #include "BackupPolicy.h"
+#include "DerivedData.h"
 #include "ExpressionParser.h"
 #include "GeoFeature.h"
 #include "License.h"
 #include "Link.h"
 #include "MergeDocuments.h"
+#include "PropertyLinks.h"
+#include "PropertyStandard.h"
+#include "ProjectFile.h"
 #include "StringHasher.h"
 #include "Transactions.h"
 
@@ -943,6 +947,9 @@ void Document::onBeforeChangeProperty(const TransactionalObject* Who, const Prop
 void Document::onChangedProperty(const DocumentObject* Who, const Property* What)
 {
     signalChangedObject(*Who, *What);
+    if (!testStatus(Document::Restoring) && !d->externalizingDerivedData) {
+        DerivedData::invalidateWorking(*this, FileName.getStrValue());
+    }
 }
 
 void Document::setTransactionMode(const int iMode) // NOLINT
@@ -1128,7 +1135,12 @@ void Document::Save(Base::Writer& writer) const
                     << Application::Config()["BuildVersionMajor"] << "."
                     << Application::Config()["BuildVersionMinor"] << "R"
                     << Application::Config()["BuildRevision"] << "\" FileVersion=\""
-                    << writer.getFileVersion() << "\" StringHasher=\"1\">\n";
+                    << writer.getFileVersion() << "\" StringHasher=\"1\"";
+    if (!d->saveDerivedGeneration.empty()) {
+        writer.Stream() << " DerivedGeneration=\""
+                        << Property::encodeAttribute(d->saveDerivedGeneration) << '"';
+    }
+    writer.Stream() << ">\n";
 
     writer.incInd();
 
@@ -1178,6 +1190,9 @@ void Document::Restore(Base::XMLReader& reader)
     else {
         reader.FileVersion = 0;
     }
+    d->derivedGeneration = reader.hasAttribute("DerivedGeneration")
+        ? reader.getAttribute<const char*>("DerivedGeneration")
+        : "";
 
     if (reader.hasAttribute("StringHasher")) {
         d->Hasher->Restore(reader);
@@ -1566,6 +1581,7 @@ static void loadDeps(const std::string& name,
 std::vector<DocumentObject*> Document::readObjects(Base::XMLReader& reader)
 {
     d->touchedObjs.clear();
+    d->serializedTouchedObjs.clear();
     bool keepDigits = testStatus(Document::KeepTrailingDigits);
     setStatus(Document::KeepTrailingDigits, !reader.doNameMapping());
     std::vector<DocumentObject*> objs;
@@ -1685,6 +1701,7 @@ std::vector<DocumentObject*> Document::readObjects(Base::XMLReader& reader)
                 if (reader.hasAttribute("Touched")) {
                     if (reader.getAttribute<long>("Touched") != 0) {
                         d->touchedObjs.insert(obj);
+                        d->serializedTouchedObjs.insert(obj);
                     }
                 }
                 if (reader.hasAttribute("Invalid")) {
@@ -1768,6 +1785,17 @@ void Document::addRecomputeObject(DocumentObject* obj) // NOLINT
         d->touchedObjs.insert(obj);
         obj->touch();
     }
+}
+
+bool Document::isDerivedProperty(const DocumentObject& object, const Property& property) const
+{
+    return d->externalizingDerivedData && property.getContainer() == &object
+        && d->externalizedDerivedProperties.contains(&property);
+}
+
+bool Document::hasDerivedDataGeneration() const
+{
+    return !d->derivedGeneration.empty() || !d->saveDerivedGeneration.empty();
 }
 
 std::vector<DocumentObject*> Document::importObjects(Base::XMLReader& reader)
@@ -2011,6 +2039,25 @@ bool Document::saveToFile(const char* filename) const
         throw Base::FileException("Unable to save document because file is marked as read-only or write permission is not available.", originalFileInfo);
     }
 
+    const std::string derivedGeneration = DerivedData::newGeneration();
+    d->externalizedDerivedProperties.clear();
+    for (const auto& item : DerivedData::items(*this, false)) {
+        d->externalizedDerivedProperties.insert(item.property);
+    }
+    d->saveDerivedGeneration = derivedGeneration;
+    d->externalizingDerivedData = true;
+    struct DerivedSaveReset
+    {
+        DocumentP* data;
+        ~DerivedSaveReset()
+        {
+            data->externalizingDerivedData = false;
+            data->saveDerivedGeneration.clear();
+            data->externalizedDerivedProperties.clear();
+        }
+    } derivedSaveReset {d};
+    DerivedData::saveGeneration(*this, nativePath, derivedGeneration);
+
     // make a tmp. file where to save the project data first and then rename to
     // the actual file name. This may be useful if overwriting an existing file
     // fails so that the data of the work up to now isn't lost.
@@ -2039,6 +2086,7 @@ bool Document::saveToFile(const char* filename) const
         if (hGrp->GetBool("SaveBinaryBrep", false)) {
             writer.setMode("BinaryBrep");
         }
+        writer.setMode("DerivedPrimary");
 
         writer.Stream() << "<?xml version='1.0' encoding='utf-8'?>" << '\n'
                         << "<!--" << '\n'
@@ -2097,6 +2145,10 @@ bool Document::saveToFile(const char* filename) const
     }
 
     signalFinishSave(*this, filename);
+
+    if (canonical_path(FileName.getValue()) == nativePath) {
+        d->derivedGeneration = derivedGeneration;
+    }
 
     return true;
 }
@@ -2215,6 +2267,101 @@ void Document::restore(const char* filename,
 
     DocumentP::checkStringHasher(reader);
 
+    d->missingDerivedObjs.clear();
+    if (!d->derivedGeneration.empty()) {
+        std::unordered_set<DocumentObject*> forcedDerivedMisses;
+        for (auto* object : d->objectArray) {
+            if (object->getTypeId().getName() != "PartDesign::SubShapeBinder") {
+                continue;
+            }
+            auto* partial = dynamic_cast<PropertyBool*>(object->getPropertyByName("PartialLoad"));
+            auto* support = dynamic_cast<PropertyXLinkSubList*>(
+                object->getPropertyByName("Support"));
+            if (!partial || !partial->getValue() || !support) {
+                continue;
+            }
+            for (const auto& link : support->getSubListValues()) {
+                if (Base::Tools::isNullOrEmpty(link.getDocumentPath())) {
+                    continue;
+                }
+                std::string currentStamp;
+                bool stampLoaded = false;
+                if (auto* linkedDocument = link.getDocument()) {
+                    currentStamp = linkedDocument->LastModifiedDate.getValue();
+                    stampLoaded = true;
+                }
+                else if (Base::FileInfo(link.getDocumentPath()).exists()) {
+                    try {
+                        ProjectFile project(link.getDocumentPath());
+                        if (project.loadDocument()) {
+                            currentStamp = project.getMetadata().lastModifiedDate;
+                            stampLoaded = true;
+                        }
+                    }
+                    catch (const Base::Exception& e) {
+                        FC_WARN("Failed to inspect external derived-data dependency "
+                                << link.getDocumentPath() << ": " << e.what());
+                    }
+                    catch (const std::exception& e) {
+                        FC_WARN("Failed to inspect external derived-data dependency "
+                                << link.getDocumentPath() << ": " << e.what());
+                    }
+                }
+                if (!stampLoaded || currentStamp != link.getDocumentStamp()) {
+                    forcedDerivedMisses.insert(object);
+                    break;
+                }
+            }
+        }
+        auto result = DerivedData::restoreGeneration(*this,
+                                                      filename,
+                                                      d->derivedGeneration,
+                                                      d->serializedTouchedObjs,
+                                                      forcedDerivedMisses);
+        std::unordered_set<DocumentObject*> missingObjects;
+        for (const auto& item : result.missing) {
+            missingObjects.insert(item.object);
+            d->missingDerivedObjs.insert(item.object);
+            if (testStatus(Document::PartialDoc) && item.object
+                && !item.object->testStatus(ObjectStatus::PartialObject)) {
+                // A partially loaded document may not contain enough dependencies to
+                // regenerate an omitted value. Mark the restored object so afterRestore()
+                // requests the existing full-document reload path instead.
+                addRecomputeObject(item.object);
+            }
+        }
+        for (const auto& item : result.restored) {
+            if (!missingObjects.contains(item.object)
+                && !d->serializedTouchedObjs.contains(item.object)) {
+                d->touchedObjs.erase(item.object);
+                item.object->purgeTouched();
+            }
+        }
+        for (auto* object : d->missingDerivedObjs) {
+            if (object->getTypeId().getName() != "PartDesign::SubShapeBinder") {
+                continue;
+            }
+            auto* partial = dynamic_cast<PropertyBool*>(object->getPropertyByName("PartialLoad"));
+            auto* support = dynamic_cast<PropertyXLinkSubList*>(
+                object->getPropertyByName("Support"));
+            if (!partial || !partial->getValue() || !support) {
+                continue;
+            }
+            for (const auto& link : support->getSubListValues()) {
+                if (link.getValue() || Base::Tools::isNullOrEmpty(link.getDocumentPath())
+                    || Base::Tools::isNullOrEmpty(link.getObjectName())) {
+                    continue;
+                }
+                // A valid cache hit intentionally avoids this load. A miss
+                // promotes the existing pending XLink request so Application
+                // restores the dependency before afterRestore() regeneration.
+                GetApplication().addPendingDocument(link.getDocumentPath(),
+                                                    link.getObjectName(),
+                                                    false);
+            }
+        }
+    }
+
     if (reader.testStatus(Base::XMLReader::ReaderStatus::PartialRestore)) {
         setStatus(Document::PartialRestore, true);
         Base::Console().error("There were errors while loading the file. Some data might have been "
@@ -2235,8 +2382,120 @@ bool Document::afterRestore(const bool checkPartial)
         GetApplication().signalPendingReloadDocument(*this);
         return false;
     }
+    const bool hadDerivedMiss = !d->missingDerivedObjs.empty();
+    bool derivedRegenerationSucceeded = true;
+    if (!d->missingDerivedObjs.empty()) {
+        std::vector<DocumentObject*> missing(d->missingDerivedObjs.begin(),
+                                             d->missingDerivedObjs.end());
+        std::unordered_set<DocumentObject*> unavailableDependencies;
+        for (auto* object : missing) {
+            if (object->getTypeId().getName() != "PartDesign::SubShapeBinder") {
+                continue;
+            }
+            auto* partial = dynamic_cast<PropertyBool*>(object->getPropertyByName("PartialLoad"));
+            auto* support = dynamic_cast<PropertyXLinkSubList*>(
+                object->getPropertyByName("Support"));
+            if (partial && partial->getValue() && support
+                && support->getValues().size() != static_cast<std::size_t>(support->getSize())) {
+                unavailableDependencies.insert(object);
+            }
+        }
+        std::unordered_set<DocumentObject*> initiallyTouched;
+        for (auto* object : d->objectArray) {
+            if (!d->missingDerivedObjs.contains(object) && object->isTouched()) {
+                initiallyTouched.insert(object);
+            }
+        }
+
+        // Do not call the ordinary consumer-closure recompute here. A regenerated
+        // sketch output would touch an authored/pinned solid consumer and
+        // thereby recreate precisely the topology that was retained to
+        // preserve generated-solid references.
+        //
+        // The dependency closure can, however, contain a retained object between
+        // two missing producers. For example, a missing sketch can support a
+        // retained datum plane which in turn supports another missing sketch.
+        // Recompute those bridge objects so the downstream missing producer sees
+        // the regenerated upstream value, without recomputing unrelated consumers.
+        auto ordered = getDependencyList(missing, DepSort);
+        std::unordered_set<DocumentObject*> regenerationClosure(d->missingDerivedObjs);
+        for (auto* object : ordered) {
+            if (!object || object->getDocument() != this
+                || regenerationClosure.contains(object)) {
+                continue;
+            }
+            for (auto* dependency : object->getOutList()) {
+                if (regenerationClosure.contains(dependency)) {
+                    regenerationClosure.insert(object);
+                    break;
+                }
+            }
+        }
+
+        std::vector<DocumentObject*> regenerated;
+        std::size_t regeneratedMissing = 0;
+        bool hasError = false;
+        {
+            Base::ObjectStatusLocker<Document::Status, Document> recomputing(Document::Recomputing,
+                                                                             this);
+            for (auto* object : ordered) {
+                if (!regenerationClosure.contains(object)) {
+                    continue;
+                }
+                if (unavailableDependencies.contains(object)) {
+                    hasError = true;
+                    object->enforceRecompute();
+                    continue;
+                }
+                object->setStatus(ObjectStatus::PendingRecompute, true);
+                object->enforceRecompute();
+                if (_recomputeFeature(object) != 0) {
+                    hasError = true;
+                }
+                else {
+                    signalRecomputedObject(*object);
+                    if (!initiallyTouched.contains(object)
+                        && !d->serializedTouchedObjs.contains(object)) {
+                        object->purgeTouched();
+                    }
+                    regenerated.push_back(object);
+                    if (d->missingDerivedObjs.contains(object)) {
+                        ++regeneratedMissing;
+                    }
+                }
+                object->setStatus(ObjectStatus::PendingRecompute, false);
+            }
+        }
+        hasError = hasError || regeneratedMissing != d->missingDerivedObjs.size();
+        signalRecomputed(*this, regenerated);
+        if (hasError) {
+            derivedRegenerationSucceeded = false;
+            Base::Console().error(
+                "Failed to regenerate one or more missing derived-data properties.\n");
+        }
+
+        // Shape setters notify their consumers even though restoring a
+        // disposable output did not alter authored state. Preserve any
+        // pre-existing touch, but remove propagation caused solely by this
+        // regeneration pass.
+        for (auto* object : d->objectArray) {
+            if (object->isValid() && !d->missingDerivedObjs.contains(object)
+                && !d->serializedTouchedObjs.contains(object) && !initiallyTouched.contains(object)) {
+                object->purgeTouched();
+            }
+        }
+        d->missingDerivedObjs.clear();
+    }
     GetApplication().signalFinishRestoreDocument(*this);
     setStatus(Document::Restoring, false);
+    if (hadDerivedMiss && derivedRegenerationSucceeded) {
+        DerivedData::refreshGeneration(*this, FileName.getStrValue(), d->derivedGeneration);
+    }
+    else if (d->derivedGeneration.empty()) {
+        // Opening a legacy full FCStd performs the cache-copy half of
+        // migration without modifying the document itself.
+        DerivedData::saveWorking(*this, FileName.getStrValue());
+    }
     return true;
 }
 
@@ -3068,6 +3327,9 @@ int Document::recompute(const std::vector<DocumentObject*>& objs,
                                                      << o.getObjectName());
             }
         }
+    }
+    if (!testStatus(Document::Restoring) && objectCount > 0 && !FileName.getStrValue().empty()) {
+        DerivedData::saveWorking(*this, FileName.getStrValue());
     }
     return objectCount;
 }

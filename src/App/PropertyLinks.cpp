@@ -303,22 +303,18 @@ void PropertyLinkBase::updateElementReferences(DocumentObject* feature, bool rev
 
 void PropertyLinkBase::updateAllElementReferences(bool reverse)
 {
-    for (auto reference : _ElementRefMap) {
-        for (auto prop : reference.second) {
-            if (prop->getContainer()) {
-                try {
-                    prop->updateElementReference(reference.first, reverse, true);
-                }
-                catch (Base::Exception& e) {
-                    e.reportException();
-                    FC_ERR("Failed to update element reference of " << propertyName(prop));
-                }
-                catch (std::exception& e) {
-                    FC_ERR("Failed to update element reference of " << propertyName(prop) << ": "
-                                                                    << e.what());
-                }
-            }
-        }
+    // Updating a property can unregister old element references and register
+    // new ones. Snapshot the keys so callbacks never invalidate the map
+    // iterator used by this traversal. updateElementReferences() takes its own
+    // snapshot of each property's set for the same reason.
+    std::vector<DocumentObject*> features;
+    features.reserve(_ElementRefMap.size());
+    for (const auto& [feature, properties] : _ElementRefMap) {
+        (void)properties;
+        features.push_back(feature);
+    }
+    for (auto* feature : features) {
+        updateElementReferences(feature, reverse);
     }
 }
 
@@ -4283,10 +4279,9 @@ void PropertyXLink::Save(Base::Writer& writer) const
                 path = _path.c_str();
             }
         }
-        writer.Stream() << writer.ind() << "<XLink file=\"" << encodeAttribute(path)
-                        << "\" stamp=\""
+        writer.Stream() << writer.ind() << "<XLink file=\"" << encodeAttribute(path) << "\" stamp=\""
                         << (docInfo && docInfo->pcDoc ? docInfo->pcDoc->LastModifiedDate.getValue()
-                                                      : "")
+                                                      : stamp)
                         << "\" name=\"" << objectName;
     }
 

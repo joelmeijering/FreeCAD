@@ -269,3 +269,48 @@ TEST_F(PropertyTopoShapeTest, testRestore)
     EXPECT_TRUE(reader.isValid());
     EXPECT_TRUE(reader.isEndOfElement());
 }
+
+TEST_F(PropertyTopoShapeTest, testPartialRestoreSkipsExternalizedShapeData)
+{
+    auto* property = _boxes[0]->addDynamicProperty("Part::PropertyPartShape", "ExternalizedShape");
+    auto* partShape = dynamic_cast<PropertyPartShape*>(property);
+    ASSERT_NE(partShape, nullptr);
+
+    std::stringstream stream(R"x(
+<Property name="ExternalizedShape" type="Part::PropertyPartShape">
+  <Part ElementMap="" Derived="1"/>
+</Property>
+)x");
+    Base::XMLReader reader("Document.xml", stream);
+    _doc->setStatus(App::Document::PartialDoc, true);
+
+    EXPECT_NO_THROW(partShape->Restore(reader));
+
+    _doc->setStatus(App::Document::PartialDoc, false);
+    EXPECT_TRUE(partShape->getShape().isNull());
+    EXPECT_STREQ(reader.localName(), "Part");
+    EXPECT_TRUE(reader.isValid());
+}
+
+TEST_F(PropertyTopoShapeTest, testPartialRestoreReadsInlineElementMap)
+{
+    auto* property = _boxes[0]->addDynamicProperty("Part::PropertyPartShape", "InlineShape");
+    auto* partShape = dynamic_cast<PropertyPartShape*>(property);
+    ASSERT_NE(partShape, nullptr);
+
+    std::stringstream stream(R"x(
+<Property name="InlineShape" type="Part::PropertyPartShape">
+  <Part ElementMap="1.2.3"/>
+  <ElementMap/>
+</Property>
+)x");
+    Base::XMLReader reader("Document.xml", stream);
+    _doc->setStatus(App::Document::PartialDoc, true);
+
+    EXPECT_NO_THROW(partShape->Restore(reader));
+
+    _doc->setStatus(App::Document::PartialDoc, false);
+    EXPECT_STREQ(partShape->getElementMapVersion(true).c_str(), "1.2.3");
+    EXPECT_STREQ(reader.localName(), "ElementMap");
+    EXPECT_TRUE(reader.isValid());
+}

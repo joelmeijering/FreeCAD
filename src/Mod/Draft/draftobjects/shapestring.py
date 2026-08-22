@@ -152,10 +152,22 @@ class ShapeString(DraftObject):
         _log("v1.0, " + obj.Name + ", changed 'Tracking' property type")
 
     def execute(self, obj):
-        if self.props_changed_placement_only() or not obj.String or not obj.FontFile:
+        # A cold derived-data restore can report only Placement and Shape
+        # changes even though the omitted Shape still needs to be rebuilt.
+        if self.props_changed_placement_only() and not obj.Shape.isNull():
             obj.positionBySupport()
             self.props_changed_clear()
             return
+
+        if not obj.String:
+            obj.Shape = Part.Shape()
+            obj.positionBySupport()
+            self.props_changed_clear()
+            return
+
+        if not obj.FontFile:
+            self.props_changed_clear()
+            raise ValueError(translate("draft", "No font file specified"))
 
         if obj.FontFile[0] == ".":
             # FontFile path relative to the FreeCAD file directory.
@@ -167,17 +179,20 @@ class ShapeString(DraftObject):
 
         # File checks:
         if not os.path.exists(font_file):
-            _err(obj.Label + ": " + translate("draft", "Font file not found"))
+            message = translate("draft", "Font file not found")
+            _err(obj.Label + ": " + message)
             self.props_changed_clear()
-            return
+            raise FileNotFoundError(message)
         if not os.path.isfile(font_file):
-            _err(obj.Label + ": " + translate("draft", "Specified font file is not a file"))
+            message = translate("draft", "Specified font file is not a file")
+            _err(obj.Label + ": " + message)
             self.props_changed_clear()
-            return
+            raise FileNotFoundError(message)
         if not os.path.splitext(font_file)[1].lower() in (".ttc", ".ttf", ".otf", ".pfb"):
-            _err(obj.Label + ": " + translate("draft", "Specified font type is not supported"))
+            message = translate("draft", "Specified font type is not supported")
+            _err(obj.Label + ": " + message)
             self.props_changed_clear()
-            return
+            raise ValueError(message)
 
         plm = obj.Placement
         fill = obj.MakeFace
@@ -252,6 +267,7 @@ class ShapeString(DraftObject):
                 shape.translate(just_vec)
             obj.Shape = Part.Compound(shapes)
         else:
+            obj.Shape = Part.Shape()
             App.Console.PrintWarning(translate("draft", "ShapeString: string has no wires") + "\n")
 
         obj.Placement = plm

@@ -1323,6 +1323,10 @@ public:
     App::Document* getDocument() const;
     const char* getDocumentPath() const;
     const char* getObjectName() const;
+    const char* getDocumentStamp() const
+    {
+        return stamp.c_str();
+    }
 
     int checkRestore(std::string* msg = nullptr) const override;
 

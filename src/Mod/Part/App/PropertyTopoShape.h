@@ -110,6 +110,11 @@ public:
 
     void afterRestore() override;
 
+    bool saveDerivedData(const std::string& directory) const override;
+    bool restoreDerivedData(const std::string& directory) override;
+    bool supportsDerivedData() const override;
+    bool hasDerivedData() const override;
+
     friend class Feature;
 
 private:

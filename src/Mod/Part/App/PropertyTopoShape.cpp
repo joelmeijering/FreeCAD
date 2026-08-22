@@ -23,10 +23,14 @@
  ***************************************************************************/
 
 
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
+#include <Standard_Version.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_ShapeSet.hxx>
 #include <OSD_OpenFile.hxx>
@@ -39,6 +43,7 @@
 #include <App/Document.h>
 #include <App/DocumentObject.h>
 #include <App/ObjectIdentifier.h>
+#include <App/StringHasher.h>
 #include <Base/Console.h>
 #include <Base/Exception.h>
 #include <Base/FileInfo.h>
@@ -62,6 +67,36 @@ TYPESYSTEM_SOURCE(Part::PropertyPartShape, App::PropertyComplexGeoData)
 PropertyPartShape::PropertyPartShape() = default;
 
 PropertyPartShape::~PropertyPartShape() = default;
+
+namespace
+{
+constexpr const char* derivedMetadataName = "Metadata.txt";
+constexpr const char* derivedBrepName = "Shape.brp";
+constexpr const char* derivedMapName = "Shape.Map";
+constexpr const char* derivedHasherName = "StringHasher.Table";
+
+void savePersistenceFile(const std::string& directory, const char* name, const Base::Persistence& value)
+{
+    Base::FileWriter writer(directory.c_str());
+    writer.putNextEntry(name);
+    value.SaveDocFile(writer);
+    writer.close();
+    if (writer.hasErrors()) {
+        throw Base::FileException(writer.getErrors().front().c_str(), directory);
+    }
+}
+
+void restorePersistenceFile(const std::filesystem::path& path, Base::Persistence& value)
+{
+    Base::FileInfo info(path.string());
+    Base::ifstream stream(info, std::ios::in | std::ios::binary);
+    if (!stream.is_open()) {
+        throw Base::FileException("Failed to open derived cache payload", info);
+    }
+    Base::Reader reader(stream, path.string(), 1);
+    value.RestoreDocFile(reader);
+}
+}  // namespace
 
 void PropertyPartShape::setValue(const TopoShape& sh)
 {
@@ -359,6 +394,9 @@ void PropertyPartShape::beforeSave() const
     _HasherIndex = 0;
     _SaveHasher = false;
     auto owner = freecad_cast<App::DocumentObject*>(getContainer());
+    if (owner && owner->getDocument() && owner->getDocument()->isDerivedProperty(*owner, *this)) {
+        return;
+    }
     if (owner && !_Shape.isNull() && _Shape.getElementMapSize() > 0) {
         auto ret = owner->getDocument()->addStringHasher(_Shape.Hasher);
         _HasherIndex = ret.second;
@@ -369,8 +407,14 @@ void PropertyPartShape::beforeSave() const
 void PropertyPartShape::Save(Base::Writer& writer) const
 {
     // See SaveDocFile(), RestoreDocFile()
-    writer.Stream() << writer.ind() << "<Part";
     auto owner = dynamic_cast<App::DocumentObject*>(getContainer());
+    if (writer.getMode("DerivedPrimary") && owner && owner->getDocument()
+        && owner->getDocument()->isDerivedProperty(*owner, *this)) {
+        writer.Stream() << writer.ind() << "<Part ElementMap=\"\" Derived=\"1\"/>\n";
+        return;
+    }
+
+    writer.Stream() << writer.ind() << "<Part";
     if (owner && !_Shape.isNull() && _Shape.getElementMapSize() > 0 && !_Shape.Hasher.isNull()) {
         writer.Stream() << " HasherIndex=\"" << _HasherIndex << '"';
         if (_SaveHasher) {
@@ -441,6 +485,9 @@ void PropertyPartShape::Restore(Base::XMLReader& reader)
     reader.readElement("Part");
 
     auto owner = freecad_cast<App::DocumentObject*>(getContainer());
+    const bool isDerivedPlaceholder = reader.getAttribute<long>("Derived", 0) != 0;
+    const bool derivedOmission =
+        isDerivedPlaceholder || (owner && owner->getDocument()->hasDerivedDataGeneration());
     _Ver = "?";
     bool has_ver = reader.hasAttribute("ElementMap");
     if (has_ver) {
@@ -481,13 +528,16 @@ void PropertyPartShape::Restore(Base::XMLReader& reader)
         // The file name here is not used for restore, but just a way to get
         // more useful error message if something wrong when restoring
         _Shape.setPersistenceFileName(getFileName().c_str());
-        if (owner && owner->getDocument()->testStatus(App::Document::PartialDoc)) {
+        // Partial loads normally restore the inline map immediately. A derived placeholder has
+        // no inline map; restoreGeneration() hydrates it after XML restoration instead.
+        if (owner && owner->getDocument()->testStatus(App::Document::PartialDoc)
+            && !isDerivedPlaceholder) {
             _Shape.Restore(reader);
         }
         else if (_Ver == "?" || _Ver.empty()) {
             // This indicate the shape is saved by legacy version without
             // element map info.
-            if (owner) {
+            if (owner && !derivedOmission) {
                 // This will ask user for recompute after import
                 owner->getDocument()->addRecomputeObject(owner);
             }
@@ -739,6 +789,121 @@ void PropertyPartShape::SaveDocFile(Base::Writer& writer) const
             shape.exportBrep(writer.Stream());
         }
     }
+}
+
+bool PropertyPartShape::hasDerivedData() const
+{
+    return !_Shape.isNull();
+}
+
+bool PropertyPartShape::supportsDerivedData() const
+{
+    return true;
+}
+
+bool PropertyPartShape::saveDerivedData(const std::string& directory) const
+{
+    namespace fs = std::filesystem;
+
+    try {
+        fs::create_directories(directory);
+
+        const bool empty = _Shape.isNull();
+        const bool hasMap = !empty && _Shape.getElementMapSize() > 0;
+        const bool hasHasher = hasMap && !_Shape.Hasher.isNull();
+
+        if (!empty) {
+            savePersistenceFile(directory, derivedBrepName, *this);
+        }
+        if (hasMap) {
+            _Shape.beforeSave();
+            savePersistenceFile(directory, derivedMapName, _Shape);
+        }
+        if (hasHasher) {
+            savePersistenceFile(directory, derivedHasherName, *_Shape.Hasher);
+        }
+
+        std::string version = _Ver;
+        auto owner = freecad_cast<App::DocumentObject*>(getContainer());
+        if ((version.empty() || version == "?") && owner) {
+            version = owner->getElementMapVersion(this);
+        }
+
+        const fs::path metadata = fs::path(directory) / derivedMetadataName;
+        std::ofstream stream(metadata, std::ios::out | std::ios::trunc);
+        stream << "FreeCADDerivedPartShape 2\n"
+               << empty << ' ' << hasMap << ' ' << hasHasher << '\n'
+               << std::quoted(OCC_VERSION_COMPLETE) << '\n'
+               << std::quoted(version) << '\n';
+        stream.close();
+        return stream.good();
+    }
+    catch (const Base::Exception& e) {
+        FC_WARN("Failed to save derived data for " << getFullName() << ": " << e.what());
+    }
+    catch (const std::exception& e) {
+        FC_WARN("Failed to save derived data for " << getFullName() << ": " << e.what());
+    }
+    return false;
+}
+
+bool PropertyPartShape::restoreDerivedData(const std::string& directory)
+{
+    namespace fs = std::filesystem;
+
+    const TopoShape oldShape = _Shape;
+    const std::string oldVersion = _Ver;
+    try {
+        const fs::path root(directory);
+        std::ifstream metadata(root / derivedMetadataName);
+        std::string marker;
+        int format = 0;
+        bool empty = false;
+        bool hasMap = false;
+        bool hasHasher = false;
+        std::string occVersion;
+        std::string version;
+        metadata >> marker >> format >> empty >> hasMap >> hasHasher >> std::quoted(occVersion)
+            >> std::quoted(version);
+        if (!metadata || marker != "FreeCADDerivedPartShape" || format != 2
+            || occVersion != OCC_VERSION_COMPLETE || (empty && (hasMap || hasHasher))
+            || (hasHasher && !hasMap)) {
+            throw Base::RuntimeError("Invalid derived PartShape metadata");
+        }
+
+        if (empty) {
+            setValue(TopoShape());
+            _Ver = version;
+            return true;
+        }
+
+        App::StringHasherRef hasher;
+        if (hasHasher) {
+            hasher = new App::StringHasher;
+            restorePersistenceFile(root / derivedHasherName, *hasher);
+        }
+
+        _Shape.resetElementMap();
+        _Shape.Hasher = hasher;
+        if (hasMap) {
+            restorePersistenceFile(root / derivedMapName, _Shape);
+        }
+
+        _Ver = version;
+        restorePersistenceFile(root / derivedBrepName, *this);
+        _Ver = version;
+        return !_Shape.isNull();
+    }
+    catch (const Base::Exception& e) {
+        FC_WARN("Failed to restore derived data for " << getFullName() << ": " << e.what());
+    }
+    catch (const std::exception& e) {
+        FC_WARN("Failed to restore derived data for " << getFullName() << ": " << e.what());
+    }
+
+    _Shape = oldShape;
+    _Ver = oldVersion;
+    return false;
 }
 
 void PropertyPartShape::RestoreDocFile(Base::Reader& reader)

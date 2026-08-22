@@ -74,6 +74,8 @@ struct DocumentP
     // Array to preserve the creation order of created objects
     std::vector<DocumentObject*> objectArray;
     std::unordered_set<App::DocumentObject*> touchedObjs;
+    std::unordered_set<App::DocumentObject*> serializedTouchedObjs;
+    std::unordered_set<App::DocumentObject*> missingDerivedObjs;
     std::unordered_map<std::string, DocumentObject*> objectMap;
     Base::UniqueNameManager objectNameManager;
     Base::UniqueNameManager objectLabelManager;
@@ -100,6 +102,10 @@ struct DocumentP
     int bookedTransaction { 0 }; 
 
     std::string programVersion;
+    std::string derivedGeneration;
+    mutable std::string saveDerivedGeneration;
+    mutable bool externalizingDerivedData {false};
+    mutable std::unordered_set<const App::Property*> externalizedDerivedProperties;
     mutable HasherMap hashers;
     std::multimap<const App::DocumentObject*, std::unique_ptr<App::DocumentObjectExecReturn>>
         _RecomputeLog;
@@ -144,6 +150,12 @@ struct DocumentP
     {
         objectLabelManager.clear();
         objectArray.clear();
+        serializedTouchedObjs.clear();
+        missingDerivedObjs.clear();
+        derivedGeneration.clear();
+        saveDerivedGeneration.clear();
+        externalizingDerivedData = false;
+        externalizedDerivedProperties.clear();
         for (auto& v : objectMap) {
             v.second->setStatus(ObjectStatus::Destroy, true);
             delete (v.second);

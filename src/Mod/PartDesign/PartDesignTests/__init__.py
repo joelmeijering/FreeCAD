@@ -3,6 +3,7 @@
 from . import TestBoolean
 from . import TestChamfer
 from . import TestDatum
+from . import TestDerivedData
 from . import TestDraft
 from . import TestFillet
 from . import TestHelix

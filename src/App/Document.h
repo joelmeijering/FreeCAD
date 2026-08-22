@@ -1258,6 +1258,12 @@ public:
      */
     void addRecomputeObject(DocumentObject* obj);
 
+    /// Return whether this property is in the classifier snapshot for the active save.
+    bool isDerivedProperty(const DocumentObject& object, const Property& property) const;
+
+    /// Return whether the document is saving or restoring an external derived-data generation.
+    bool hasDerivedDataGeneration() const;
+
     /// Get the old label of an object before it was changed.
     const std::string& getOldLabel() const
     {

@@ -100,6 +100,72 @@ class TestDerivedData(unittest.TestCase):
         self.assertFalse(chamfer.Base[1][0].startswith("?"))
         return box, fillet, chamfer
 
+    def testDatumColdRestoreDefersAttachmentUntilSupportExists(self):
+        root = pathlib.Path(self._temporary_directory.name)
+        source_file = root / "datum.FCStd"
+        moved_file = root / "datum-cold.FCStd"
+        document = App.newDocument("PartDesignDerivedDataDatum")
+        body = document.addObject("PartDesign::Body", "Body")
+        sketch = body.newObject("Sketcher::SketchObject", "Sketch")
+        sketch.addGeometry(
+            Part.Circle(App.Vector(10, 20, 0), App.Vector(0, 0, 1), 5), False
+        )
+        source = body.newObject("PartDesign::Pad", "SourcePad")
+        source.Profile = sketch
+        source.Length = 5
+        document.recompute()
+        plane = body.newObject("PartDesign::Plane", "Plane")
+        plane.AttachmentSupport = (source, ["Vertex1"])
+        plane.MapMode = "Translate"
+        consumer = body.newObject("Sketcher::SketchObject", "Consumer")
+        consumer.AttachmentSupport = (plane, [""])
+        consumer.MapMode = "FlatFace"
+        consumer.addGeometry(
+            Part.Circle(App.Vector(0, 0, 0), App.Vector(0, 0, 1), 2), False
+        )
+        document.recompute()
+        expected_position = plane.Placement.Base
+        expected_shape = self._shape_signature(consumer.Shape)
+        self._document_uid = document.Uid
+        document.saveAs(str(source_file))
+        App.closeDocument(document.Name)
+
+        class Observer:
+            def __init__(self):
+                self.support_notifications = 0
+                self.invalid_events = []
+
+            def slotChangedObject(self, obj, prop):
+                if obj.Name == "Plane":
+                    if prop == "AttachmentSupport":
+                        self.support_notifications += 1
+                    if not obj.isValid():
+                        self.invalid_events.append((prop, obj.State))
+
+        shutil.copy2(source_file, moved_file)
+        for path in (source_file, moved_file):
+            observer = Observer()
+            App.addDocumentObserver(observer)
+            try:
+                document = App.openDocument(str(path))
+            finally:
+                App.removeDocumentObserver(observer)
+            # The view still receives the support notification, without an
+            # early attachment evaluation against a not-yet-rebuilt solid.
+            self.assertGreater(observer.support_notifications, 0)
+            self.assertFalse(observer.invalid_events, observer.invalid_events)
+            self.assertTrue(document.Plane.isValid())
+            self.assertTrue(document.Consumer.isValid())
+            self.assertLess((document.Plane.Placement.Base - expected_position).Length, 1e-9)
+            self.assertEqual(expected_shape, self._shape_signature(document.Consumer.Shape))
+            App.closeDocument(document.Name)
+
+        # A genuinely missing subelement must still fail during recompute.
+        document = App.openDocument(str(moved_file))
+        document.Plane.AttachmentSupport = (document.SourcePad, ["Vertex999"])
+        document.recompute()
+        self.assertFalse(document.Plane.isValid())
+
     def testColdReconstructionPreservesDressUpReferences(self):
         root = pathlib.Path(self._temporary_directory.name)
         source_directory = root / "source"
@@ -375,6 +441,71 @@ class TestDerivedData(unittest.TestCase):
         shutil.copy2(source_file, moved_file)
         document = App.openDocument(str(moved_file))
         assert_reconstructed(document)
+
+    def testSliceApartCollisionFiltersColdReconstruction(self):
+        from BOPTools.SplitFeatures import makeSlice
+        from CompoundTools.CompoundFilter import makeCompoundFilter
+
+        root = pathlib.Path(self._temporary_directory.name)
+        source_file = root / "source.FCStd"
+        moved_file = root / "moved.FCStd"
+        document = App.newDocument("PartDesignDerivedDataCollisionFilters")
+        base = document.addObject("Part::Feature", "Base")
+        base.Shape = Part.makeBox(20, 15, 10)
+        planes = []
+        for name, height in (("LowPlane", 4), ("HighPlane", 7)):
+            plane = document.addObject("Part::Feature", name)
+            plane.Shape = Part.makePlane(30, 25, App.Vector(-5, -5, height))
+            planes.append(plane)
+        sliced = makeSlice("Slice")
+        sliced.Base = base
+        sliced.Tools = planes
+        sliced.Mode = "Split"
+
+        def select(name, source, stencil, invert=False):
+            child = makeCompoundFilter(name)
+            child.Base = source
+            child.FilterType = "collision-pass"
+            child.Stencil = stencil
+            child.Invert = invert
+            return child
+
+        upper_pair = select("UpperPair", sliced, planes[1])
+        middle = select("Middle", upper_pair, planes[0])
+        upper = select("Upper", sliced, planes[0], True)
+        lower = select("Lower", sliced, planes[1], True)
+        # A filter outside a Slice chain must retain the conservative policy.
+        retained = select("UnrelatedFilter", base, planes[0])
+        document.recompute()
+        children = (upper_pair, middle, upper, lower)
+        expected = {
+            child.Name: self._shape_signature(child.Shape) for child in children
+        }
+        self.assertEqual(len(upper_pair.Shape.Solids), 2)
+        for child, volume in ((middle, 900), (upper, 900), (lower, 1200)):
+            self.assertEqual(len(child.Shape.Solids), 1)
+            self.assertAlmostEqual(child.Shape.Volume, volume, places=7)
+        self._document_uid = document.Uid
+        document.saveAs(str(source_file))
+        App.closeDocument(document.Name)
+
+        with zipfile.ZipFile(source_file) as archive:
+            self.assertGreaterEqual(archive.read("Document.xml").count(b'Derived="1"'), 5)
+            for name in expected:
+                self.assertFalse(any(entry.startswith(name + ".Shape.")
+                                     for entry in archive.namelist()))
+            self.assertTrue(any(entry.startswith("UnrelatedFilter.Shape.")
+                                for entry in archive.namelist()))
+
+        for path in (source_file, moved_file):
+            if path == moved_file:
+                shutil.copy2(source_file, moved_file)
+            restored = App.openDocument(str(path))
+            for name, signature in expected.items():
+                child = restored.getObject(name)
+                self.assertTrue(child.isValid(), child.State)
+                self.assertEqual(signature, self._shape_signature(child.Shape))
+            App.closeDocument(restored.Name)
 
     def testPythonProxyTypeStringDoesNotQualifyDerivedShape(self):
         root = pathlib.Path(self._temporary_directory.name)

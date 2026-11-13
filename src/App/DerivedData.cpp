@@ -322,17 +322,33 @@ bool isFeatureSlice(const App::DocumentObject& object)
 
 bool isSliceApartChild(const App::DocumentObject& object)
 {
-    if (object.getTypeId().getName() != std::string_view("Part::FeaturePython")
-        || !hasPythonProxyClass(object, "CompoundTools.CompoundFilter", "_CompoundFilter")) {
-        return false;
+    // Plane-based collision filters identify sections even when a recompute
+    // changes the order of the slice's solids. Such filters, including chains
+    // that intersect multiple selections, are as reproducible as index filters.
+    std::unordered_set<const App::DocumentObject*> visited;
+    const auto* current = &object;
+    while (current && visited.insert(current).second) {
+        if (current->getTypeId().getName() != std::string_view("Part::FeaturePython")
+            || !hasPythonProxyClass(*current, "CompoundTools.CompoundFilter", "_CompoundFilter")) {
+            return false;
+        }
+        const auto* base = dynamic_cast<const App::PropertyLink*>(
+            current->getPropertyByName("Base")
+        );
+        const auto* filter = dynamic_cast<const App::PropertyEnumeration*>(
+            current->getPropertyByName("FilterType")
+        );
+        if (!base || !base->getValue() || !filter
+            || !(filter->isValue("specific items")
+                 || (filter->isValue("collision-pass") && hasLinks(*current, "Stencil")))) {
+            return false;
+        }
+        current = base->getValue();
+        if (isFeatureSlice(*current)) {
+            return true;
+        }
     }
-
-    const auto* base = dynamic_cast<const App::PropertyLink*>(object.getPropertyByName("Base"));
-    const auto* filter = dynamic_cast<const App::PropertyEnumeration*>(
-        object.getPropertyByName("FilterType")
-    );
-    return base && base->getValue() && isFeatureSlice(*base->getValue()) && filter
-        && filter->isValue("specific items");
+    return false;
 }
 
 bool isCandidate(const App::DocumentObject& object, const App::Property& property)
@@ -715,11 +731,6 @@ App::DerivedData::RestoreResult App::DerivedData::restoreGeneration(
     const std::unordered_set<DocumentObject*>& forcedMisses)
 {
     RestoreResult result;
-    // Empty omission markers deliberately touch their owners during normal
-    // PropertyPartShape restore. That touch is a regeneration request, not
-    // evidence that the cache item was stale when its generation was saved.
-    // Embedded values, including a touched value that was demoted on save,
-    // remain authoritative and must never be overwritten from the cache.
     auto classified = classifiedItems(document, false, true);
     std::erase_if(classified, [&serializedTouched](const Item& item) {
         return serializedTouched.contains(item.object) || item.property->hasDerivedData();

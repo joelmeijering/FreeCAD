@@ -501,6 +501,7 @@ GeomAbs_SurfaceType FaceTypedCylinder::getType() const
 
 // Auxiliary method
 const TopoDS_Face fixFace(const TopoDS_Face& f)
+try
 {
     static TopoDS_Face dummy;
     // Fix the face. Orientation doesn't seem to get fixed the first call.
@@ -523,6 +524,14 @@ const TopoDS_Face fixFace(const TopoDS_Face& f)
         return dummy;
     }
     return faceFixer.Face();
+}
+catch (const Standard_Failure&)
+{
+    // OCCT can throw while repairing a proposed cylindrical face (for example,
+    // when FixOrientation encounters a void bounding box). Treat this like
+    // ShapeExtend_FAIL: keep the original faces and continue refining the rest
+    // of the shell instead of aborting the entire refinement.
+    return {};
 }
 
 // Detect whether a wire encircles the cylinder axis or not. This is done by calculating the

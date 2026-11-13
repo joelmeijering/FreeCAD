@@ -2267,9 +2267,15 @@ void Document::restore(const char* filename,
 
     DocumentP::checkStringHasher(reader);
 
+    // Files with a derivedGeneration UUID need their derived data restored on file load
+    // This means loading cached blobs (if present) or recomputing in order
     d->missingDerivedObjs.clear();
     if (!d->derivedGeneration.empty()) {
         std::unordered_set<DocumentObject*> forcedDerivedMisses;
+        // Check if cached externally referenced documents are still actual
+        // Re-load external data only if cache is outdated
+        // TODO this is silly, unless reloading is extremely slow
+        // TODO probably this loop can be removed.
         for (auto* object : d->objectArray) {
             if (object->getTypeId().getName() != "PartDesign::SubShapeBinder") {
                 continue;
@@ -2407,16 +2413,6 @@ bool Document::afterRestore(const bool checkPartial)
             }
         }
 
-        // Do not call the ordinary consumer-closure recompute here. A regenerated
-        // sketch output would touch an authored/pinned solid consumer and
-        // thereby recreate precisely the topology that was retained to
-        // preserve generated-solid references.
-        //
-        // The dependency closure can, however, contain a retained object between
-        // two missing producers. For example, a missing sketch can support a
-        // retained datum plane which in turn supports another missing sketch.
-        // Recompute those bridge objects so the downstream missing producer sees
-        // the regenerated upstream value, without recomputing unrelated consumers.
         auto ordered = getDependencyList(missing, DepSort);
         std::unordered_set<DocumentObject*> regenerationClosure(d->missingDerivedObjs);
         for (auto* object : ordered) {
@@ -2474,10 +2470,6 @@ bool Document::afterRestore(const bool checkPartial)
                 "Failed to regenerate one or more missing derived-data properties.\n");
         }
 
-        // Shape setters notify their consumers even though restoring a
-        // disposable output did not alter authored state. Preserve any
-        // pre-existing touch, but remove propagation caused solely by this
-        // regeneration pass.
         for (auto* object : d->objectArray) {
             if (object->isValid() && !d->missingDerivedObjs.contains(object)
                 && !d->serializedTouchedObjs.contains(object) && !initiallyTouched.contains(object)) {

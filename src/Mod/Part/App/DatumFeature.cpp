@@ -24,6 +24,8 @@
  ***************************************************************************/
 
 
+#include <Base/Tools.h>
+
 #include "DatumFeature.h"
 #include "OCCError.h"
 #include "PartPyCXX.h"
@@ -44,8 +46,16 @@ Datum::~Datum() = default;
 
 void Datum::onDocumentRestored()
 {
-    // This seems to be the only way to make the ViewProvider display the datum feature
-    AttachmentSupport.touch();
+    // Notify the ViewProvider without evaluating the attachment here. Its support
+    // may have omitted derived geometry that is rebuilt after object restoration.
+    // The attachment extension restores its placement below and normal recompute
+    // resolves it once the support is available.
+    {
+        Base::ObjectStatusLocker<App::ObjectStatus, App::DocumentObject> restoring(
+            App::ObjectStatus::Restore, this
+        );
+        AttachmentSupport.touch();
+    }
     Part::Feature::onDocumentRestored();
 }
 

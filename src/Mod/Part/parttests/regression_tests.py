@@ -22,6 +22,33 @@ class RegressionTests(unittest.TestCase):
         self.Doc = newDocument("PartRegressionTest." + self._testMethodName)
         self.KeepTestDoc = False
 
+    def test_refine_cylinder_face_repair_failure(self):
+        """A failed cylinder merge must not abort refinement of other faces."""
+        # Two valid adjacent cylindrical faces whose proposed union makes
+        # OCCT 7.8's ShapeFix_Face::FixOrientation throw "Bnd_Box is void".
+        shell = Part.Shape()
+        shell.read(os.path.join(os.path.dirname(__file__), "refine_cylinder_void_box.brep"))
+        self.assertTrue(shell.isValid())
+        self.assertEqual(len(shell.Faces), 2)
+
+        boxes = Part.makeBox(1, 1, 1, Vector(100, 0, 0)).fuse(
+            Part.makeBox(1, 1, 1, Vector(101, 0, 0))
+        )
+        self.assertEqual(len(boxes.Faces), 10)
+        original = Part.makeCompound([shell, boxes])
+        refined = original.removeSplitter()
+
+        self.assertTrue(original.isValid())
+        self.assertTrue(refined.isValid())
+        self.assertEqual(len(refined.Solids), 1)
+        self.assertEqual(len(refined.Solids[0].Faces), 6)
+        self.assertAlmostEqual(refined.Solids[0].Volume, 2.0, places=7)
+        self.assertAlmostEqual(refined.Area, original.Area, places=7)
+        # The troublesome faces are retained, not removed from the shell.
+        shells = [child for child in refined.childShapes() if child.ShapeType == "Shell"]
+        self.assertEqual(len(shells), 1)
+        self.assertAlmostEqual(shells[0].Area, shell.Area, places=7)
+
     def test_issue_4456(self):
         """
         0004456: Regression : Part.Plane.Intersect does not accept plane as argument
